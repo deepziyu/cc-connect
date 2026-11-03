@@ -38,6 +38,8 @@ type WSPlatform struct {
 	reqSeq      atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong  atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map     // req_id -> chan wsAckResult, for sequential send with ack waiting
+	ackTimeout  time.Duration
+	now         func() time.Time
 }
 
 const (
@@ -46,6 +48,15 @@ const (
 )
 
 var errWSAckTimeout = errors.New("wecom-ws: ack timeout")
+
+type wsAckError struct {
+	Code int
+	Msg  string
+}
+
+func (e *wsAckError) Error() string {
+	return fmt.Sprintf("wecom-ws: ack error: errcode=%d errmsg=%s", e.Code, e.Msg)
+}
 
 // wsReplyContext holds the context needed to reply to a specific message.
 type wsReplyContext struct {
@@ -308,7 +319,7 @@ func (p *WSPlatform) handleFrame(frame wsFrame) {
 		default:
 			var ackErr error
 			if frame.ErrCode != nil && *frame.ErrCode != 0 {
-				ackErr = fmt.Errorf("wecom-ws: ack error: errcode=%d errmsg=%s", *frame.ErrCode, frame.ErrMsg)
+				ackErr = &wsAckError{Code: *frame.ErrCode, Msg: frame.ErrMsg}
 				slog.Warn("wecom-ws: reply/send ack error", "req_id", reqID, "errcode", *frame.ErrCode, "errmsg", frame.ErrMsg)
 			} else {
 				slog.Debug("wecom-ws: reply/send ack ok", "req_id", reqID)
@@ -476,22 +487,14 @@ func (p *WSPlatform) Reply(ctx context.Context, rctx any, content string) error 
 	if !ok {
 		return fmt.Errorf("wecom-ws: invalid reply context type %T", rctx)
 	}
-	if content == "" {
+	if !hasVisibleStreamChar(content) {
 		return nil
 	}
 
 	streamID := p.generateReqID("stream")
-	frame := map[string]any{
-		"cmd":     "aibot_respond_msg",
-		"headers": map[string]string{"req_id": rc.reqID},
-		"body": map[string]any{
-			"msgtype": "stream",
-			"stream": map[string]any{
-				"id":      streamID,
-				"finish":  true,
-				"content": content,
-			},
-		},
+	frame, err := buildWSStreamFrame(rc.reqID, streamID, content, true)
+	if err != nil {
+		return err
 	}
 	if err := p.writeJSON(frame); err != nil {
 		slog.Error("wecom-ws: reply failed", "user", rc.userID, "error", err)

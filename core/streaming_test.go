@@ -609,3 +609,86 @@ func TestStreamPreview_UnfreezeIdempotent(t *testing.T) {
 		t.Fatal("canPreview() = false after no-op unfreeze, want true")
 	}
 }
+
+type mockFinisherPlatform struct {
+	mockKeepPreviewPlatform
+	finishErr error
+}
+
+func (m *mockFinisherPlatform) FinishPreview(_ context.Context, _ any, content string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.finishErr != nil {
+		return m.finishErr
+	}
+	m.messages = append(m.messages, "finish:"+content)
+	m.lastMsg = content
+	return nil
+}
+
+func TestStreamPreview_FinishCallsPreviewFinisherEvenWhenBodyUnchanged(t *testing.T) {
+	mp := &mockFinisherPlatform{}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello ")
+	time.Sleep(80 * time.Millisecond)
+	sp.appendText("World")
+	time.Sleep(80 * time.Millisecond)
+
+	// Final text matches lastSentText and statusFooter is empty, yet PreviewFinisher
+	// MUST still be called so finish=true seals the bubble.
+	if !sp.finish("Hello World", "") {
+		t.Fatal("finish should return true when PreviewFinisher succeeds")
+	}
+
+	msgs := mp.getMessages()
+	if got := msgs[len(msgs)-1]; got != "finish:Hello World" {
+		t.Fatalf("last message = %q, want 'finish:Hello World' (all=%#v)", got, msgs)
+	}
+}
+
+func TestStreamPreview_FinishPreviewErrorFallsBackToCallerSend(t *testing.T) {
+	mp := &mockFinisherPlatform{finishErr: context.DeadlineExceeded}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(80 * time.Millisecond)
+
+	if sp.finish("Hello World", "") {
+		t.Fatal("finish should return false when FinishPreview fails so caller falls back to Send")
+	}
+}
+
+func TestStreamPreview_DetachPreviewSealsViaPreviewFinisher(t *testing.T) {
+	mp := &mockFinisherPlatform{}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Pre-tool segment")
+	time.Sleep(80 * time.Millisecond)
+
+	sp.freeze()
+	sp.detachPreview()
+
+	msgs := mp.getMessages()
+	if got := msgs[len(msgs)-1]; got != "finish:Pre-tool segment" {
+		t.Fatalf("last message after detachPreview = %q, want 'finish:Pre-tool segment' (all=%#v)", got, msgs)
+	}
+}
