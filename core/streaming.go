@@ -132,6 +132,20 @@ type PreviewStarter interface {
 	SendPreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error)
 }
 
+// PreviewFinisher is an optional interface for platforms whose streaming
+// protocol distinguishes intermediate updates from a terminal frame that seals
+// the message (for example WeCom WebSocket stream replies with finish=true).
+type PreviewFinisher interface {
+	FinishPreview(ctx context.Context, previewHandle any, content string) error
+}
+
+// StreamStarter and StreamFinisher alias the preview lifecycle interfaces for
+// external callers that drive platform streaming handles directly.
+type (
+	StreamStarter  = PreviewStarter
+	StreamFinisher = PreviewFinisher
+)
+
 // PreviewCleaner is an optional interface for platforms that need to clean up
 // the preview message after the final response is sent (e.g. Discord deletes
 // the preview and sends a fresh message).
@@ -415,21 +429,30 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	if sp.transform != nil {
 		finalText = sp.transform(finalText)
 	}
+	finisher, hasFinisher := sp.platform.(PreviewFinisher)
 	if sp.previewMsgID == nil || sp.degraded {
 		if sp.previewMsgID != nil && sp.degraded {
-			// Try to recover degraded preview via UpdateMessage before falling back to delete
+			// Try to recover degraded preview via FinishPreview / UpdateMessage before falling back to delete
 			if finalText != "" {
-				if updater, ok := sp.platform.(MessageUpdater); ok {
-					if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText); err == nil {
+				var recoverErr error
+				var canRecover bool
+				if hasFinisher {
+					canRecover = true
+					recoverErr = finisher.FinishPreview(sp.ctx, sp.previewMsgID, finalText)
+				} else if updater, ok := sp.platform.(MessageUpdater); ok {
+					canRecover = true
+					recoverErr = updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText)
+				}
+				if canRecover {
+					if recoverErr == nil {
 						if sp.pendingStatus != "" {
 							if statusUpdater, ok := sp.platform.(PreviewStatusUpdater); ok {
 								statusUpdater.SetPreviewStatus(sp.previewMsgID, sp.pendingStatus)
 							}
 						}
 						return true
-					} else {
-						slog.Debug("stream preview finish: degraded UpdateMessage failed, cleaning up", "error", err)
 					}
+					slog.Debug("stream preview finish: degraded finalize failed, cleaning up", "error", recoverErr)
 				}
 			}
 			if cleaner, ok := sp.platform.(PreviewCleaner); ok {
@@ -465,16 +488,11 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	}
 
 	// If the final text is identical to what was last sent via UpdateMessage
-	// AND no status footer needs to be applied, skip the redundant API call.
-	// This prevents duplicate messages on platforms (e.g. Feishu) where
-	// patching with identical content may fail. We must NOT skip when a
-	// statusFooter is pending — the body may match but the footer hasn't
-	// been rendered yet, and dropping the call would silently lose it.
-	// Only skip when lastSentViaUpdate is true — if the text was only sent
-	// via SendPreviewStart (first flush), we must still call UpdateMessage
-	// because it may apply different formatting (e.g. Markdown→HTML for
-	// Telegram).
-	if finalText == sp.lastSentText && sp.lastSentViaUpdate && statusFooter == "" {
+	// AND no status footer needs to be applied, skip the redundant API call —
+	// EXCEPT when the platform implements PreviewFinisher, whose intermediate
+	// UpdateMessage frames (finish=false) leave the bubble spinning until an
+	// explicit FinishPreview (finish=true) seals it.
+	if !hasFinisher && finalText == sp.lastSentText && sp.lastSentViaUpdate && statusFooter == "" {
 		slog.Debug("stream preview finish: text unchanged and no footer, skipping",
 			"text_len", len(finalText))
 		return true
@@ -486,7 +504,7 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	slog.Debug("stream preview finish: sending final UpdateMessage",
 		"text_len", len(finalText), "lastSent_len", len(sp.lastSentText),
 		"same", finalText == sp.lastSentText, "viaUpdate", sp.lastSentViaUpdate,
-		"footer_len", len(statusFooter))
+		"footer_len", len(statusFooter), "hasFinisher", hasFinisher)
 
 	// Prefer the structured-footer path when the platform supports it, so the
 	// footer renders with small/dim styling separate from the response body.
@@ -503,10 +521,16 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 		finalText = appendReplyFooter(finalText, statusFooter)
 	}
 
-	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText); err != nil {
-		slog.Debug("stream preview finish: final update FAILED, cleaning up preview", "error", err)
-		// Update failed (e.g. text too long for platform edit API).
-		// Try to delete the stale preview so caller can send a fresh message.
+	var finishErr error
+	if hasFinisher {
+		finishErr = finisher.FinishPreview(sp.ctx, sp.previewMsgID, finalText)
+	} else {
+		finishErr = updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText)
+	}
+	if finishErr != nil {
+		slog.Debug("stream preview finish: final update FAILED, cleaning up preview", "error", finishErr)
+		// Update failed (e.g. text too long or stream expired).
+		// Try to delete/seal the stale preview so caller can send a fresh message.
 		if cleaner, ok := sp.platform.(PreviewCleaner); ok {
 			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
 		}
@@ -517,7 +541,7 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 			statusUpdater.SetPreviewStatus(sp.previewMsgID, sp.pendingStatus)
 		}
 	}
-	slog.Debug("stream preview finish: success via UpdateMessage")
+	slog.Debug("stream preview finish: success")
 	return true
 }
 
@@ -539,9 +563,25 @@ func (sp *streamPreview) setStatus(status CardStatus) {
 // detachPreview clears the preview message handle so that finish() won't
 // delete it. Call this after freeze() when the frozen preview should remain
 // visible as a permanent message (e.g. text before the first tool call).
+// Platforms implementing PreviewFinisher have the detached handle sealed here
+// so the frozen bubble stops spinning before a new preview is opened later.
 func (sp *streamPreview) detachPreview() {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
+	if sp.previewMsgID != nil {
+		if finisher, ok := sp.platform.(PreviewFinisher); ok {
+			frozenText := sp.lastSentText
+			if frozenText == "" && sp.fullText != "" {
+				frozenText = sp.fullText
+				if sp.transform != nil {
+					frozenText = sp.transform(frozenText)
+				}
+			}
+			if frozenText != "" {
+				_ = finisher.FinishPreview(sp.ctx, sp.previewMsgID, frozenText)
+			}
+		}
+	}
 	sp.previewMsgID = nil
 }
 

@@ -28,6 +28,7 @@ type WSPlatform struct {
 	botID       string
 	secret      string
 	allowFrom   string
+	wsURL       string // WebSocket endpoint; defaults to wsEndpoint (公有云), 可经 ws_url 覆盖为私有化部署地址
 	conn        *websocket.Conn
 	handler     core.MessageHandler
 	ctx         context.Context
@@ -37,6 +38,8 @@ type WSPlatform struct {
 	reqSeq      atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong  atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map     // req_id -> chan wsAckResult, for sequential send with ack waiting
+	ackTimeout  time.Duration
+	now         func() time.Time
 }
 
 const (
@@ -45,6 +48,15 @@ const (
 )
 
 var errWSAckTimeout = errors.New("wecom-ws: ack timeout")
+
+type wsAckError struct {
+	Code int
+	Msg  string
+}
+
+func (e *wsAckError) Error() string {
+	return fmt.Sprintf("wecom-ws: ack error: errcode=%d errmsg=%s", e.Code, e.Msg)
+}
 
 // wsReplyContext holds the context needed to reply to a specific message.
 type wsReplyContext struct {
@@ -124,11 +136,17 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 		return nil, fmt.Errorf("wecom-ws: bot_id and bot_secret are required for websocket mode")
 	}
 	allowFrom, _ := opts["allow_from"].(string)
+	wsURL, _ := opts["ws_url"].(string)
+	wsURL = strings.TrimSpace(wsURL)
+	if wsURL == "" {
+		wsURL = wsEndpoint
+	}
 
 	return &WSPlatform{
 		botID:     botID,
 		secret:    secret,
 		allowFrom: allowFrom,
+		wsURL:     wsURL,
 	}, nil
 }
 
@@ -186,9 +204,9 @@ func (p *WSPlatform) connectLoop() {
 
 // runConnection dials, subscribes, and processes messages until disconnection.
 func (p *WSPlatform) runConnection() error {
-	slog.Info("wecom-ws: connecting", "endpoint", wsEndpoint)
+	slog.Info("wecom-ws: connecting", "endpoint", p.wsURL)
 
-	conn, _, err := websocket.DefaultDialer.DialContext(p.ctx, wsEndpoint, nil)
+	conn, _, err := websocket.DefaultDialer.DialContext(p.ctx, p.wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -301,7 +319,7 @@ func (p *WSPlatform) handleFrame(frame wsFrame) {
 		default:
 			var ackErr error
 			if frame.ErrCode != nil && *frame.ErrCode != 0 {
-				ackErr = fmt.Errorf("wecom-ws: ack error: errcode=%d errmsg=%s", *frame.ErrCode, frame.ErrMsg)
+				ackErr = &wsAckError{Code: *frame.ErrCode, Msg: frame.ErrMsg}
 				slog.Warn("wecom-ws: reply/send ack error", "req_id", reqID, "errcode", *frame.ErrCode, "errmsg", frame.ErrMsg)
 			} else {
 				slog.Debug("wecom-ws: reply/send ack ok", "req_id", reqID)
@@ -407,56 +425,56 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 		chatName = body.ChatID
 	}
 
-	texts, imgRefs, fileRefs := wsCollectInboundParts(&body)
+	current, quoted := wsCollectInboundParts(&body)
+	quotedContent := formatWSQuotedContent(quoted)
 
 	switch body.MsgType {
 	case "voice":
 		vt := stripWeComAtMentions(wsVoiceText(body.Voice), p.botID, body.AibotID)
-		if vt == "" && len(imgRefs) == 0 && len(fileRefs) == 0 {
+		if vt != "" {
+			current.content = append([]string{vt}, current.content...)
+		}
+		if len(current.content) == 0 && quotedContent == "" && !current.hasMedia() && !quoted.hasMedia() {
 			slog.Debug("wecom-ws: voice message with empty transcription, ignoring")
 			return
 		}
-		if len(imgRefs) > 0 || len(fileRefs) > 0 {
-			out := []string{}
-			if vt != "" {
-				out = append(out, vt)
-			}
-			out = append(out, texts...)
-			slog.Info("wecom-ws: voice + media", "user", body.From.UserID, "images", len(imgRefs), "files", len(fileRefs))
-			go p.deliverWSMediaInbound(&body, sessionKey, chatName, rctx, out, imgRefs, fileRefs)
+		if current.hasMedia() || quoted.hasMedia() {
+			slog.Info("wecom-ws: voice + media", "user", body.From.UserID, "images", len(current.images)+len(quoted.images), "files", len(current.files)+len(quoted.files))
+			go p.deliverWSMediaInbound(&body, sessionKey, chatName, rctx, current, quoted, true)
 			return
 		}
-		slog.Debug("wecom-ws: voice received (transcribed)", "user", body.From.UserID, "len", len(vt))
+		content := stripWeComAtMentions(strings.Join(current.content, "\n"), p.botID, body.AibotID)
+		slog.Debug("wecom-ws: voice received (transcribed)", "user", body.From.UserID, "len", len(content))
 		go p.handler(p, &core.Message{
 			SessionKey: sessionKey, Platform: "wecom",
 			MessageID: body.MsgID,
 			UserID:    body.From.UserID, UserName: body.From.UserID,
 			ChatName: chatName,
-			Content:  vt, ReplyCtx: rctx, FromVoice: true,
+			Content:  content, ExtraContent: quotedContent, ReplyCtx: rctx, FromVoice: true,
 		})
 		return
 	}
 
-	if len(imgRefs) == 0 && len(fileRefs) == 0 {
-		if len(texts) == 0 {
+	if !current.hasMedia() && !quoted.hasMedia() {
+		if len(current.content) == 0 && quotedContent == "" {
 			slog.Warn("wecom-ws: no text or media in message", "msg_type", body.MsgType, "msg_id", body.MsgID)
 			return
 		}
-		content := stripWeComAtMentions(strings.Join(texts, "\n"), p.botID, body.AibotID)
+		content := stripWeComAtMentions(strings.Join(current.content, "\n"), p.botID, body.AibotID)
 		slog.Debug("wecom-ws: text received", "user", body.From.UserID, "len", len(content))
 		go p.handler(p, &core.Message{
 			SessionKey: sessionKey, Platform: "wecom",
 			MessageID: body.MsgID,
 			UserID:    body.From.UserID, UserName: body.From.UserID,
 			ChatName: chatName,
-			Content:  content, ReplyCtx: rctx,
+			Content:  content, ExtraContent: quotedContent, ReplyCtx: rctx,
 		})
 		return
 	}
 
 	slog.Info("wecom-ws: media message", "msg_type", body.MsgType, "user", body.From.UserID,
-		"images", len(imgRefs), "files", len(fileRefs), "text_parts", len(texts))
-	go p.deliverWSMediaInbound(&body, sessionKey, chatName, rctx, texts, imgRefs, fileRefs)
+		"images", len(current.images)+len(quoted.images), "files", len(current.files)+len(quoted.files), "text_parts", len(current.content))
+	go p.deliverWSMediaInbound(&body, sessionKey, chatName, rctx, current, quoted, false)
 }
 
 // Reply sends a response message via aibot_respond_msg using the stream format.
@@ -469,22 +487,14 @@ func (p *WSPlatform) Reply(ctx context.Context, rctx any, content string) error 
 	if !ok {
 		return fmt.Errorf("wecom-ws: invalid reply context type %T", rctx)
 	}
-	if content == "" {
+	if !hasVisibleStreamChar(content) {
 		return nil
 	}
 
 	streamID := p.generateReqID("stream")
-	frame := map[string]any{
-		"cmd":     "aibot_respond_msg",
-		"headers": map[string]string{"req_id": rc.reqID},
-		"body": map[string]any{
-			"msgtype": "stream",
-			"stream": map[string]any{
-				"id":      streamID,
-				"finish":  true,
-				"content": content,
-			},
-		},
+	frame, err := buildWSStreamFrame(rc.reqID, streamID, content, true)
+	if err != nil {
+		return err
 	}
 	if err := p.writeJSON(frame); err != nil {
 		slog.Error("wecom-ws: reply failed", "user", rc.userID, "error", err)
