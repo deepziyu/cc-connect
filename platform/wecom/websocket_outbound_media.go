@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -16,24 +19,29 @@ import (
 const (
 	wecomWSUploadChunkSize = 512 * 1024
 	wecomWSUploadMaxChunks = 100
+	wecomWSImageMaxBytes   = 10 * 1024 * 1024
+	wecomWSFileMaxBytes    = 20 * 1024 * 1024
 )
 
 // SendImage uploads and sends an image through the WeCom AI Bot WebSocket API.
 func (p *WSPlatform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
 	rc, ok := rctx.(wsReplyContext)
 	if !ok {
-		return fmt.Errorf("wecom-ws: SendImage: invalid reply context type %T", rctx)
+		return mediaFailure(fmt.Errorf("wecom-ws: SendImage: invalid reply context type %T", rctx))
 	}
 	if rc.chatID == "" {
-		return fmt.Errorf("wecom-ws: chatID is empty, cannot send image")
+		return mediaFailure(fmt.Errorf("wecom-ws: chatID is empty, cannot send image"))
 	}
 	if len(img.Data) == 0 {
-		return fmt.Errorf("wecom-ws: image data is empty")
+		return mediaFailure(fmt.Errorf("wecom-ws: image data is empty"))
 	}
 
+	if len(img.Data) > wecomWSImageMaxBytes {
+		return p.SendFile(ctx, rctx, core.FileAttachment{FileName: wsImageFileName(img), MimeType: img.MimeType, Data: img.Data})
+	}
 	mediaID, err := p.uploadWSMedia(ctx, "image", wsImageFileName(img), img.Data)
 	if err != nil {
-		return fmt.Errorf("wecom-ws: send image: %w", err)
+		return mediaFailure(fmt.Errorf("wecom-ws: send image: %w", err))
 	}
 	if err := p.sendWSMediaMessage(ctx, rc.chatID, "image", mediaID); err != nil {
 		return fmt.Errorf("wecom-ws: send image: %w", err)
@@ -42,6 +50,9 @@ func (p *WSPlatform) SendImage(ctx context.Context, rctx any, img core.ImageAtta
 }
 
 func (p *WSPlatform) uploadWSMedia(ctx context.Context, mediaType, filename string, data []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	totalChunks := (len(data) + wecomWSUploadChunkSize - 1) / wecomWSUploadChunkSize
 	if totalChunks == 0 {
 		return "", fmt.Errorf("empty media data")
@@ -63,7 +74,7 @@ func (p *WSPlatform) uploadWSMedia(ctx context.Context, mediaType, filename stri
 			"md5":          hex.EncodeToString(sum[:]),
 		},
 	}
-	initResp, err := p.writeAndWaitFrameWithTimeout(ctx, initFrame, initReqID, wsMediaAckTimeout)
+	initResp, err := p.writeAndWaitMediaFrame(ctx, initFrame, initReqID)
 	if err != nil {
 		return "", fmt.Errorf("upload init: %w", err)
 	}
@@ -77,7 +88,7 @@ func (p *WSPlatform) uploadWSMedia(ctx context.Context, mediaType, filename stri
 		return "", fmt.Errorf("upload init: empty upload_id")
 	}
 
-	for i := 0; i < totalChunks; i++ {
+	err = uploadWSChunks(ctx, totalChunks, func(ctx context.Context, i int) error {
 		start := i * wecomWSUploadChunkSize
 		end := start + wecomWSUploadChunkSize
 		if end > len(data) {
@@ -93,9 +104,13 @@ func (p *WSPlatform) uploadWSMedia(ctx context.Context, mediaType, filename stri
 				"base64_data": base64.StdEncoding.EncodeToString(data[start:end]),
 			},
 		}
-		if _, err := p.writeAndWaitFrameWithTimeout(ctx, chunkFrame, reqID, wsMediaAckTimeout); err != nil {
-			return "", fmt.Errorf("upload chunk %d: %w", i, err)
+		if _, err := p.writeAndWaitMediaFrame(ctx, chunkFrame, reqID); err != nil {
+			return fmt.Errorf("upload chunk %d: %w", i, err)
 		}
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 
 	finishReqID := p.generateReqID("aibot_upload_media_finish")
@@ -106,7 +121,7 @@ func (p *WSPlatform) uploadWSMedia(ctx context.Context, mediaType, filename stri
 			"upload_id": initBody.UploadID,
 		},
 	}
-	finishResp, err := p.writeAndWaitFrameWithTimeout(ctx, finishFrame, finishReqID, wsMediaAckTimeout)
+	finishResp, err := p.writeAndWaitMediaFrame(ctx, finishFrame, finishReqID)
 	if err != nil {
 		return "", fmt.Errorf("upload finish: %w", err)
 	}
@@ -123,6 +138,9 @@ func (p *WSPlatform) uploadWSMedia(ctx context.Context, mediaType, filename stri
 }
 
 func (p *WSPlatform) sendWSMediaMessage(ctx context.Context, chatID, mediaType, mediaID string) error {
+	if err := ctx.Err(); err != nil {
+		return mediaFailure(err)
+	}
 	reqID := p.generateReqID("aibot_send_msg")
 	frame := map[string]any{
 		"cmd":     "aibot_send_msg",
@@ -135,7 +153,14 @@ func (p *WSPlatform) sendWSMediaMessage(ctx context.Context, chatID, mediaType, 
 			},
 		},
 	}
-	return p.writeAndWaitAckStrict(ctx, frame, reqID, wsMediaAckTimeout)
+	result, err := p.writeAndWaitMediaResult(ctx, frame, reqID)
+	if err != nil {
+		return &wsMediaDeliveryError{state: "Unknown", err: err}
+	}
+	if result.err != nil {
+		return mediaFailure(result.err)
+	}
+	return nil
 }
 
 func wsImageFileName(img core.ImageAttachment) string {
@@ -159,18 +184,21 @@ func wsImageFileName(img core.ImageAttachment) string {
 func (p *WSPlatform) SendFile(ctx context.Context, rctx any, file core.FileAttachment) error {
 	rc, ok := rctx.(wsReplyContext)
 	if !ok {
-		return fmt.Errorf("wecom-ws: SendFile: invalid reply context type %T", rctx)
+		return mediaFailure(fmt.Errorf("wecom-ws: SendFile: invalid reply context type %T", rctx))
 	}
 	if rc.chatID == "" {
-		return fmt.Errorf("wecom-ws: chatID is empty, cannot send file")
+		return mediaFailure(fmt.Errorf("wecom-ws: chatID is empty, cannot send file"))
 	}
 	if len(file.Data) == 0 {
-		return fmt.Errorf("wecom-ws: file data is empty")
+		return mediaFailure(fmt.Errorf("wecom-ws: file data is empty"))
 	}
 
+	if len(file.Data) > wecomWSFileMaxBytes {
+		return mediaFailure(fmt.Errorf("wecom-ws: file exceeds 20 MiB quota"))
+	}
 	mediaID, err := p.uploadWSMedia(ctx, "file", wsFileFileName(file), file.Data)
 	if err != nil {
-		return fmt.Errorf("wecom-ws: send file: %w", err)
+		return mediaFailure(fmt.Errorf("wecom-ws: send file: %w", err))
 	}
 	if err := p.sendWSMediaMessage(ctx, rc.chatID, "file", mediaID); err != nil {
 		return fmt.Errorf("wecom-ws: send file: %w", err)
@@ -203,3 +231,107 @@ func wsFileFileName(file core.FileAttachment) string {
 
 var _ core.ImageSender = (*WSPlatform)(nil)
 var _ core.FileSender = (*WSPlatform)(nil)
+
+// wsMediaDeliveryError is queryable across package boundaries via errors.As.
+// Unknown means the final message may have reached WeCom; it must not be retried.
+type wsMediaDeliveryError struct {
+	state string
+	err   error
+}
+
+func (e *wsMediaDeliveryError) Error() string         { return e.err.Error() }
+func (e *wsMediaDeliveryError) Unwrap() error         { return e.err }
+func (e *wsMediaDeliveryError) DeliveryState() string { return e.state }
+func mediaFailure(err error) error                    { return &wsMediaDeliveryError{state: "DefinitelyFailed", err: err} }
+
+func wsUploadConcurrency(chunks int) int {
+	if chunks <= 4 {
+		return chunks
+	}
+	if chunks <= 10 {
+		return 3
+	}
+	return 2
+}
+
+// Each slice is attempted once. A lost ACK aborts this upload; it is never
+// retried with a fresh request ID. Finish waits until every slice ACK succeeds.
+func uploadWSChunks(parent context.Context, total int, send func(context.Context, int) error) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+	for worker := 0; worker < wsUploadConcurrency(total); worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				index := int(next.Add(1) - 1)
+				if index >= total {
+					return
+				}
+				if err := send(ctx, index); err != nil {
+					once.Do(func() { firstErr = err; cancel() })
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
+}
+
+// Media writes must honor the upload budget even when the socket stops reading.
+// The same mutex used by writeJSON protects setting/resetting its write deadline.
+func (p *WSPlatform) writeAndWaitMediaResult(ctx context.Context, frame map[string]any, reqID string) (wsAckResult, error) {
+	ch := make(chan wsAckResult, 1)
+	p.pendingAcks.Store(reqID, ch)
+	defer p.pendingAcks.Delete(reqID)
+	p.mu.Lock()
+	err := ctx.Err()
+	if err == nil {
+		if p.conn == nil {
+			err = fmt.Errorf("wecom-ws: not connected")
+		} else {
+			deadline := time.Now().Add(wsMediaAckTimeout)
+			if budget, ok := ctx.Deadline(); ok && budget.Before(deadline) {
+				deadline = budget
+			}
+			err = p.conn.SetWriteDeadline(deadline)
+			if err == nil {
+				err = p.conn.WriteJSON(frame)
+			}
+			_ = p.conn.SetWriteDeadline(time.Time{})
+		}
+	}
+	p.mu.Unlock()
+	if err != nil {
+		return wsAckResult{}, err
+	}
+	timer := time.NewTimer(wsMediaAckTimeout)
+	defer timer.Stop()
+	select {
+	case result := <-ch:
+		return result, nil
+	case <-ctx.Done():
+		return wsAckResult{}, ctx.Err()
+	case <-timer.C:
+		return wsAckResult{}, errWSAckTimeout
+	}
+}
+
+func (p *WSPlatform) writeAndWaitMediaFrame(ctx context.Context, frame map[string]any, reqID string) (wsFrame, error) {
+	result, err := p.writeAndWaitMediaResult(ctx, frame, reqID)
+	if err != nil {
+		return wsFrame{}, err
+	}
+	if result.err != nil {
+		return wsFrame{}, result.err
+	}
+	return result.frame, nil
+}
